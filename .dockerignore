@@ -1,0 +1,7 @@
+.git
+.github
+.idea
+.venv
+flink-job/target
+runtime-data
+README.md

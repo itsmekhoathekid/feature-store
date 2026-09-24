@@ -1,0 +1,175 @@
+name: feature-store-demo
+
+x-python-build: &python-build
+  context: .
+  dockerfile: docker/python.Dockerfile
+
+x-python-service: &python-service
+  image: feature-store-demo-python:local
+  working_dir: /workspace
+  environment:
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    FEAST_SERVER_URL: http://feast:6566
+    FEAST_REPO_PATH: /workspace/feast
+    DATA_DIR: /data
+  volumes:
+    - ./runtime-data:/data
+
+services:
+  kafka:
+    image: apache/kafka:3.9.1@sha256:4ceccc577f03f51f6af8dbfda55194d0d892f4fa7913ffbded567ce3895622ed
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka-init:
+    image: apache/kafka:3.9.1@sha256:4ceccc577f03f51f6af8dbfda55194d0d892f4fa7913ffbded567ce3895622ed
+    command:
+      - sh
+      - -ec
+      - |
+        for topic in raw.transactions.v1 features.customer_30d.v1 transactions.late.v1 transactions.invalid.v1 features.customer_30d.push-dlq.v1; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$topic" --partitions 1 --replication-factor 1
+        done
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  redis:
+    image: redis:7.4.2-alpine@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  feast:
+    <<: *python-service
+    build: *python-build
+    command: ["sh", "/workspace/docker/feast-entrypoint.sh"]
+    volumes:
+      - ./runtime-data:/data
+      - ./docker:/workspace/docker:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "6566:6566"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:6566/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  raw-mirror:
+    <<: *python-service
+    profiles: ["sfv"]
+    command: ["python", "-m", "feature_store_demo.raw_mirror"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  sfv-runner:
+    <<: *python-service
+    profiles: ["sfv"]
+    command: ["python", "-m", "feature_store_demo.sfv_runner"]
+    depends_on:
+      feast:
+        condition: service_healthy
+      raw-mirror:
+        condition: service_started
+
+  seed:
+    <<: *python-service
+    command: ["python", "-m", "feature_store_demo.seed"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  verify:
+    <<: *python-service
+    depends_on:
+      feast:
+        condition: service_healthy
+
+  feast-pusher:
+    <<: *python-service
+    profiles: ["flink"]
+    command: ["python", "-m", "feature_store_demo.pusher"]
+    depends_on:
+      feast:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  flink-jobmanager:
+    image: flink:2.2.1-scala_2.12-java17@sha256:13b1328bbb86263b41e740f06790f49c8512a26a5c0eba36a8f91b1983d33a6c
+    profiles: ["flink"]
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.checkpoints.dir: file:///checkpoints
+        execution.checkpointing.interval: 10s
+    volumes:
+      - ./flink-job/target:/opt/flink/usrlib
+      - ./runtime-data/checkpoints:/checkpoints
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  flink-taskmanager:
+    image: flink:2.2.1-scala_2.12-java17@sha256:13b1328bbb86263b41e740f06790f49c8512a26a5c0eba36a8f91b1983d33a6c
+    profiles: ["flink"]
+    command: taskmanager
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.checkpoints.dir: file:///checkpoints
+    volumes:
+      - ./runtime-data/checkpoints:/checkpoints
+    depends_on:
+      - flink-jobmanager
+
+  flink-build:
+    image: maven:3.9.11-eclipse-temurin-17@sha256:e4a7ace3dc0d645ed97f8d9ad0b0d3f0b14fa8d150138f27f116d7105a639b82
+    working_dir: /workspace/flink-job
+    command: ["mvn", "-q", "clean", "package"]
+    volumes:
+      - .:/workspace
+      - maven-cache:/root/.m2
+
+  python-test:
+    <<: *python-service
+    command: ["sh", "-c", "ruff check python feast docker scripts && python -m pytest -q"]
+
+volumes:
+  maven-cache:
