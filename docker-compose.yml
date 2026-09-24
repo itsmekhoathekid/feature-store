@@ -126,7 +126,10 @@ services:
         condition: service_completed_successfully
 
   flink-jobmanager:
-    image: flink:2.2.1-scala_2.12-java17@sha256:13b1328bbb86263b41e740f06790f49c8512a26a5c0eba36a8f91b1983d33a6c
+    image: feature-store-demo-pyflink:local
+    build:
+      context: .
+      dockerfile: docker/flink-python.Dockerfile
     profiles: ["flink"]
     command: jobmanager
     ports:
@@ -137,15 +140,19 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         state.checkpoints.dir: file:///checkpoints
         execution.checkpointing.interval: 10s
+        python.client.executable: /opt/pyflink/bin/python
+        python.executable: /opt/pyflink/bin/python
     volumes:
-      - ./flink-job/target:/opt/flink/usrlib
       - ./runtime-data/checkpoints:/checkpoints
     depends_on:
       kafka-init:
         condition: service_completed_successfully
 
   flink-taskmanager:
-    image: flink:2.2.1-scala_2.12-java17@sha256:13b1328bbb86263b41e740f06790f49c8512a26a5c0eba36a8f91b1983d33a6c
+    image: feature-store-demo-pyflink:local
+    build:
+      context: .
+      dockerfile: docker/flink-python.Dockerfile
     profiles: ["flink"]
     command: taskmanager
     environment:
@@ -154,22 +161,22 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
         state.checkpoints.dir: file:///checkpoints
+        python.client.executable: /opt/pyflink/bin/python
+        python.executable: /opt/pyflink/bin/python
     volumes:
       - ./runtime-data/checkpoints:/checkpoints
     depends_on:
       - flink-jobmanager
 
-  flink-build:
-    image: maven:3.9.11-eclipse-temurin-17@sha256:e4a7ace3dc0d645ed97f8d9ad0b0d3f0b14fa8d150138f27f116d7105a639b82
-    working_dir: /workspace/flink-job
-    command: ["mvn", "-q", "clean", "package"]
-    volumes:
-      - .:/workspace
-      - maven-cache:/root/.m2
+  flink-test:
+    image: feature-store-demo-pyflink:local
+    build:
+      context: .
+      dockerfile: docker/flink-python.Dockerfile
+    profiles: ["test"]
+    entrypoint: ["/opt/pyflink/bin/python"]
+    command: ["-m", "pytest", "-q", "/opt/flink/usrlib/tests"]
 
   python-test:
     <<: *python-service
     command: ["sh", "-c", "ruff check python feast docker scripts && python -m pytest -q"]
-
-volumes:
-  maven-cache:

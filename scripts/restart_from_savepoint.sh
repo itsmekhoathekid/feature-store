@@ -22,7 +22,7 @@ if [ -z "$savepoint" ]; then
   exit 1
 fi
 
-docker compose cp flink-job/target/flink-customer-features.jar \
-  flink-jobmanager:/tmp/flink-customer-features.jar
 docker compose exec -T flink-jobmanager \
-  flink run -d -s "$savepoint" /tmp/flink-customer-features.jar
+  flink run -d -s "$savepoint" \
+    -py /opt/flink/usrlib/customer_feature_job.py \
+    -pyexec /opt/pyflink/bin/python

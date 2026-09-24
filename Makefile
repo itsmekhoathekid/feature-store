@@ -1,7 +1,7 @@
 SHELL := /bin/sh
 COMPOSE := docker compose
 
-.PHONY: build-python up-sfv demo-sfv up-flink build-flink submit-flink demo-flink seed verify verify-flink-topics test test-java test-python test-restart check-readme down
+.PHONY: build-python up-sfv demo-sfv up-flink build-flink submit-flink demo-flink seed verify verify-flink-topics test test-flink test-python test-restart check-readme down
 
 build-python:
 	$(COMPOSE) build feast
@@ -16,11 +16,12 @@ up-flink: build-flink build-python
 	$(COMPOSE) --profile flink up -d kafka kafka-init redis feast flink-jobmanager flink-taskmanager feast-pusher
 
 build-flink:
-	$(COMPOSE) run --rm flink-build
+	$(COMPOSE) build flink-jobmanager
 
 submit-flink: build-flink
-	$(COMPOSE) cp flink-job/target/flink-customer-features.jar flink-jobmanager:/tmp/flink-customer-features.jar
-	$(COMPOSE) exec flink-jobmanager flink run -d /tmp/flink-customer-features.jar
+	$(COMPOSE) exec flink-jobmanager flink run -d \
+		-py /opt/flink/usrlib/customer_feature_job.py \
+		-pyexec /opt/pyflink/bin/python
 
 demo-flink: up-flink submit-flink seed
 	$(COMPOSE) run --rm verify python -m feature_store_demo.integration_check
@@ -35,10 +36,10 @@ verify:
 verify-flink-topics:
 	$(COMPOSE) run --rm verify python -m feature_store_demo.integration_check
 
-test: test-java test-python
+test: test-flink test-python
 
-test-java:
-	$(COMPOSE) run --rm flink-build mvn -q test
+test-flink: build-flink
+	$(COMPOSE) run --rm flink-test
 
 test-python: build-python
 	$(COMPOSE) run --rm python-test

@@ -1,0 +1,4 @@
+apache-flink==2.2.1
+pytest==8.4.2
+ruff==0.13.1
+
