@@ -3,9 +3,9 @@
 Repo này triển khai đúng hai cách tính feature giao dịch 30 ngày:
 
 1. Feast `StreamFeatureView` chạy aggregation bằng Spark compute engine.
-2. Flink DataStream API dùng `AggregateFunction`, ghi aggregate sang Kafka rồi push vào Feast bằng `PushSource`.
+2. PyFlink DataStream API dùng `AggregateFunction`, ghi aggregate sang Kafka rồi push vào Feast bằng `PushSource`.
 
-Không có pipeline thứ ba. Toàn bộ runtime chạy bằng Docker Compose; dependency Python, Maven và Docker image đều được pin phiên bản, các image nền còn được pin theo digest.
+Không có pipeline thứ ba. Toàn bộ runtime chạy bằng Docker Compose; dependency Python, Kafka connector và Docker image đều được pin phiên bản, các image nền còn được pin theo digest.
 
 ## Kiến trúc
 
@@ -58,7 +58,7 @@ Cửa sổ là `[T-30 days, T)`, trượt mỗi giờ. Mỗi event thuộc 720 c
 
 ### Kafka source, aggregation 30 ngày và tiling
 
-Source: [`feast/features.py`, lines 22–65](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/feast/features.py#L22-L65)
+Source: [`feast/features.py`, lines 22–65](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/feast/features.py#L22-L65)
 
 ```python
 raw_transactions_stream = KafkaSource(
@@ -110,193 +110,193 @@ customer_30d_sfv = StreamFeatureView(
 > **Note**
 > Kafka khai báo JSON contract, event timestamp, watermark một giờ và batch source Parquet. Hai aggregation dùng cùng cửa sổ 30 ngày/slide một giờ; tiling một giờ tái sử dụng các tile trung gian. Raw mirror loại duplicate theo `event_id` trước khi Spark materialize vào Redis. `offline=False` tránh ghi aggregate ngược vào file raw.
 
-Feast 0.66.0 đánh dấu `StreamFeatureView` là alpha. Phiên bản này có hai lỗi ở Spark worker khi giải mã proto và khi ánh xạ schema sau aggregation; image áp dụng một compatibility shim nhỏ, có test riêng, tại [`docker/feast_serde.py`](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/docker/feast_serde.py).
+Feast 0.66.0 đánh dấu `StreamFeatureView` là alpha. Phiên bản này có hai lỗi ở Spark worker khi giải mã proto và khi ánh xạ schema sau aggregation; image áp dụng một compatibility shim nhỏ, có test riêng, tại [`docker/feast_serde.py`](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/docker/feast_serde.py).
 
-## Cách 2 — Flink DataStream API
+## Cách 2 — PyFlink DataStream API
 
 ### Watermark theo event time
 
-Source: [`CustomerFeatureJob.java`, lines 62–69](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/flink-job/src/main/java/io/github/itsmekhoathekid/featurestore/CustomerFeatureJob.java#L62-L69)
+Source: [`job.py`, lines 40–46](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/flink-job/feature_store_flink/job.py#L40-L46)
 
-```java
-        WatermarkStrategy<TransactionEvent> watermarks = WatermarkStrategy
-                .<TransactionEvent>forBoundedOutOfOrderness(MAX_OUT_OF_ORDERNESS)
-                .withTimestampAssigner((event, previousTimestamp) -> event.getEventTimestampMs())
-                .withIdleness(IDLE_TIMEOUT);
-
-        SingleOutputStreamOperator<TransactionEvent> timestamped = parsed
-                .assignTimestampsAndWatermarks(watermarks)
-                .name("event-time-watermarks");
+```python
+def watermark_strategy() -> WatermarkStrategy:
+    # with_idleness() returns a new PyFlink wrapper, so attach the Python timestamp assigner last.
+    return (
+        WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_hours(1))
+        .with_idleness(Duration.of_minutes(1))
+        .with_timestamp_assigner(EventTimestampAssigner())
+    )
 ```
 
 > **Note**
-> `MAX_OUT_OF_ORDERNESS` là một giờ và `IDLE_TIMEOUT` là một phút. Watermark quyết định lúc cửa sổ đóng; idleness ngăn partition không có dữ liệu giữ watermark chung đứng yên. Bước tiếp theo key stream theo `event_id` để deduplicate.
+> Bounded out-of-orderness là một giờ và idle timeout là một phút. Watermark quyết định lúc cửa sổ đóng; idleness ngăn partition không có dữ liệu giữ watermark chung đứng yên. Với PyFlink, `with_idleness()` tạo wrapper mới nên timestamp assigner phải gắn sau cùng để không bị mất.
 
 ### Sliding window và operator chain
 
-Source: [`CustomerFeatureJob.java`, lines 76–82](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/flink-job/src/main/java/io/github/itsmekhoathekid/featurestore/CustomerFeatureJob.java#L76-L82)
+Source: [`job.py`, lines 92–111](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/flink-job/feature_store_flink/job.py#L92-L111)
 
-```java
-        SingleOutputStreamOperator<CustomerFeatureRecord> features = deduplicated
-                .keyBy(TransactionEvent::getCustomerId)
-                .window(SlidingEventTimeWindows.of(Duration.ofDays(30), Duration.ofHours(1)))
-                .allowedLateness(Duration.ZERO)
-                .sideOutputLateData(lateOutput)
-                .aggregate(new TransactionAggregate(), new WindowResultFunction())
-                .name("customer-30-day-aggregate");
+```python
+    deduplicated = (
+        timestamped.key_by(lambda event: event[EVENT_ID], key_type=Types.STRING())
+        .process(DeduplicateByEventId(), output_type=EVENT_TYPE)
+        .name("deduplicate-by-event-id")
+        .uid("deduplicate-by-event-id")
+    )
+    features = (
+        deduplicated.key_by(lambda event: event[CUSTOMER_ID], key_type=Types.STRING())
+        .window(SlidingEventTimeWindows.of(Time.days(30), Time.hours(1)))
+        .allowed_lateness(0)
+        .side_output_late_data(LATE_OUTPUT)
+        .aggregate(
+            TransactionAggregate(),
+            AddWindowMetadata(),
+            accumulator_type=ACCUMULATOR_TYPE,
+            output_type=FEATURE_TYPE,
+        )
+        .name("customer-30-day-aggregate")
+        .uid("customer-30-day-aggregate")
+    )
 ```
 
 > **Note**
-> `SlidingEventTimeWindows` tạo window 30 ngày theo từng giờ và giữ biên phải loại trừ. `AggregateFunction` cập nhật state tăng dần; `ProcessWindowFunction` chỉ thêm key và metadata. Event đã trễ được tách ra, không làm thay đổi feature đã phát.
+> Stream được key theo `event_id` trước khi deduplicate, rồi key lại theo `customer_id`. `SlidingEventTimeWindows` tạo window 30 ngày theo từng giờ và giữ biên phải loại trừ. UID ổn định giúp stateful operator khôi phục từ savepoint; event đã trễ được tách ra thay vì sửa feature đã phát.
 
 ### Incremental AggregateFunction
 
-Source: [`TransactionAggregate.java`, lines 8–34](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/flink-job/src/main/java/io/github/itsmekhoathekid/featurestore/TransactionAggregate.java#L8-L34)
+Source: [`operators.py`, lines 105–124](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/flink-job/feature_store_flink/operators.py#L105-L124)
 
-```java
-public final class TransactionAggregate
-        implements AggregateFunction<TransactionEvent, CustomerAccumulator, AggregateResult> {
+```python
+class TransactionAggregate(AggregateFunction):
+    def create_accumulator(self) -> tuple[float, int]:
+        return 0.0, 0
 
-    @Override
-    public CustomerAccumulator createAccumulator() {
-        return new CustomerAccumulator(0.0, 0L);
-    }
+    def add(
+        self,
+        value: tuple[str, str, float, int],
+        accumulator: tuple[float, int],
+    ) -> tuple[float, int]:
+        return accumulator[0] + value[AMOUNT], accumulator[1] + 1
 
-    @Override
-    public CustomerAccumulator add(TransactionEvent event, CustomerAccumulator accumulator) {
-        accumulator.setTotalAmount(accumulator.getTotalAmount() + event.getAmount());
-        accumulator.setTxCount(accumulator.getTxCount() + 1L);
-        return accumulator;
-    }
+    def get_result(self, accumulator: tuple[float, int]) -> tuple[float, int]:
+        return accumulator
 
-    @Override
-    public AggregateResult getResult(CustomerAccumulator accumulator) {
-        return new AggregateResult(accumulator.getTotalAmount(), accumulator.getTxCount());
-    }
-
-    @Override
-    public CustomerAccumulator merge(CustomerAccumulator left, CustomerAccumulator right) {
-        return new CustomerAccumulator(
-                left.getTotalAmount() + right.getTotalAmount(),
-                left.getTxCount() + right.getTxCount());
-    }
-}
+    def merge(
+        self,
+        accumulator_a: tuple[float, int],
+        accumulator_b: tuple[float, int],
+    ) -> tuple[float, int]:
+        return accumulator_a[0] + accumulator_b[0], accumulator_a[1] + accumulator_b[1]
 ```
 
 > **Note**
-> Accumulator chỉ giữ tổng tiền và số giao dịch, không giữ toàn bộ raw event. `add()` chạy cho từng event; `getResult()` tạo output; `merge()` cộng hai partial accumulator để vẫn đúng khi Flink hợp nhất state. Cả bốn method đều có unit test.
+> Đây là `pyflink.datastream.functions.AggregateFunction` native. Accumulator chỉ giữ tổng tiền và số giao dịch, không giữ toàn bộ raw event. `add()` chạy cho từng event; `get_result()` tạo output; `merge()` cộng hai partial accumulator. Cả bốn method đều có unit test.
 
 ### Bổ sung key và metadata cửa sổ
 
-Source: [`WindowResultFunction.java`, lines 10–31](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/flink-job/src/main/java/io/github/itsmekhoathekid/featurestore/WindowResultFunction.java#L10-L31)
+Source: [`operators.py`, lines 131–149](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/flink-job/feature_store_flink/operators.py#L131-L149)
 
-```java
-public final class WindowResultFunction
-        extends ProcessWindowFunction<AggregateResult, CustomerFeatureRecord, String, TimeWindow> {
-
-    @Override
-    public void process(
-            String customerId,
-            Context context,
-            Iterable<AggregateResult> aggregateResults,
-            Collector<CustomerFeatureRecord> output) {
-        AggregateResult aggregate = aggregateResults.iterator().next();
-        long windowEnd = context.window().getEnd();
-        output.collect(
-                new CustomerFeatureRecord(
-                        customerId,
-                        aggregate.getTotalAmount(),
-                        aggregate.getTxCount(),
-                        context.window().getStart(),
-                        windowEnd,
-                        Instant.ofEpochMilli(windowEnd).toString(),
-                        Instant.now().toString()));
-    }
-}
+```python
+class AddWindowMetadata(ProcessWindowFunction):
+    def process(
+        self,
+        key: str,
+        context: ProcessWindowFunction.Context,
+        elements: Iterable[tuple[float, int]],
+    ) -> Iterable[tuple[str, float, int, int, int, str, str]]:
+        total_amount, tx_count = next(iter(elements))
+        window = context.window()
+        window_end_ms = window.end
+        yield (
+            key,
+            total_amount,
+            tx_count,
+            window.start,
+            window_end_ms,
+            iso_timestamp(window_end_ms),
+            datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        )
 ```
 
 > **Note**
-> Hàm này nhận đúng một kết quả đã aggregate, nên không buffer raw events. `event_timestamp` chính là `window_end`; điều đó cho phép Feast chọn bản ghi mới nhất theo entity và cho phép parity test ghép hai pipeline tại cùng cửa sổ.
+> `ProcessWindowFunction` nhận đúng một kết quả incremental aggregate, nên không buffer raw events lần thứ hai. Hàm bổ sung customer, `window_start` và `window_end`; `event_timestamp` bằng `window_end` để Feast chọn bản mới nhất và parity test ghép hai pipeline tại cùng cửa sổ.
 
 ### Deduplicate bằng ValueState và TTL
 
-Source: [`DeduplicateByEventId.java`, lines 28–68](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/flink-job/src/main/java/io/github/itsmekhoathekid/featurestore/DeduplicateByEventId.java#L28-L68)
+Source: [`operators.py`, lines 77–102](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/flink-job/feature_store_flink/operators.py#L77-L102)
 
-```java
-    @Override
-    public void open(OpenContext context) throws Exception {
-        StateTtlConfig ttl = stateTtlConfig();
-        ValueStateDescriptor<String> descriptor =
-                new ValueStateDescriptor<>("event-fingerprint", String.class);
-        descriptor.enableTimeToLive(ttl);
-        fingerprintState = getRuntimeContext().getState(descriptor);
-    }
+```python
+class DeduplicateByEventId(KeyedProcessFunction):
+    TTL_DAYS = 32
 
-    static StateTtlConfig stateTtlConfig() {
-        return StateTtlConfig.newBuilder(Duration.ofDays(32))
-                .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
-                .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
-                .build();
-    }
+    def open(self, runtime_context) -> None:
+        ttl = (
+            StateTtlConfig.new_builder(Time.days(self.TTL_DAYS))
+            .update_ttl_on_create_and_write()
+            .never_return_expired()
+            .build()
+        )
+        descriptor = ValueStateDescriptor("event-fingerprint", Types.STRING())
+        descriptor.enable_time_to_live(ttl)
+        self.fingerprint_state = runtime_context.get_state(descriptor)
 
-    static Decision classify(String storedFingerprint, TransactionEvent event) {
-        if (storedFingerprint == null) {
-            return Decision.ACCEPT;
-        }
-        if (storedFingerprint.equals(event.fingerprint())) {
-            return Decision.IGNORE_EXACT_DUPLICATE;
-        }
-        return Decision.REJECT_CONFLICT;
-    }
-
-    @Override
-    public void processElement(
-            TransactionEvent event,
-            Context context,
-            Collector<TransactionEvent> output) throws Exception {
-        String storedFingerprint = fingerprintState.value();
-        Decision decision = classify(storedFingerprint, event);
-        if (decision == Decision.ACCEPT) {
-            fingerprintState.update(event.fingerprint());
-            output.collect(event);
-        } else if (decision == Decision.REJECT_CONFLICT) {
-            context.output(
-                    invalidOutput,
-                    "conflicting duplicate event_id=" + event.getEventId());
-        }
+    def process_element(
+        self,
+        value: tuple[str, str, float, int],
+        ctx: KeyedProcessFunction.Context,
+    ):
+        fingerprint = event_fingerprint(value)
+        stored = self.fingerprint_state.value()
+        if stored is None:
+            self.fingerprint_state.update(fingerprint)
+            yield value
+        elif stored != fingerprint:
+            yield INVALID_OUTPUT, f"conflicting duplicate event_id={value[EVENT_ID]}"
 ```
 
 > **Note**
-> Stream được key theo `event_id`, vì vậy mỗi key có một fingerprint trong `ValueState`. Duplicate giống hệt bị bỏ qua; cùng ID nhưng khác nội dung đi sang invalid topic. TTL 32 ngày dài hơn feature window hai ngày và dùng processing time; test harness xác minh cả suppression lẫn expiry.
+> Stream đã key theo `event_id`, vì vậy mỗi key có một fingerprint trong PyFlink `ValueState`. Duplicate giống hệt không yield output; cùng ID nhưng khác nội dung đi sang invalid topic. TTL processing-time 32 ngày dài hơn feature window hai ngày; test xác minh suppression, conflict và cấu hình TTL/visibility.
 
 ### Late-event side output
 
-Source: [`CustomerFeatureJob.java`, lines 76–88](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/flink-job/src/main/java/io/github/itsmekhoathekid/featurestore/CustomerFeatureJob.java#L76-L88)
+Source: [`job.py`, lines 98–123](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/flink-job/feature_store_flink/job.py#L98-L123)
 
-```java
-        SingleOutputStreamOperator<CustomerFeatureRecord> features = deduplicated
-                .keyBy(TransactionEvent::getCustomerId)
-                .window(SlidingEventTimeWindows.of(Duration.ofDays(30), Duration.ofHours(1)))
-                .allowedLateness(Duration.ZERO)
-                .sideOutputLateData(lateOutput)
-                .aggregate(new TransactionAggregate(), new WindowResultFunction())
-                .name("customer-30-day-aggregate");
+```python
+    features = (
+        deduplicated.key_by(lambda event: event[CUSTOMER_ID], key_type=Types.STRING())
+        .window(SlidingEventTimeWindows.of(Time.days(30), Time.hours(1)))
+        .allowed_lateness(0)
+        .side_output_late_data(LATE_OUTPUT)
+        .aggregate(
+            TransactionAggregate(),
+            AddWindowMetadata(),
+            accumulator_type=ACCUMULATOR_TYPE,
+            output_type=FEATURE_TYPE,
+        )
+        .name("customer-30-day-aggregate")
+        .uid("customer-30-day-aggregate")
+    )
 
-        features.sinkTo(featureSink(bootstrapServers, FEATURE_TOPIC, "customer-feature-"))
-                .name("aggregate-kafka-sink");
-        features.getSideOutput(lateOutput)
-                .sinkTo(transactionSink(bootstrapServers, LATE_TOPIC, "late-event-"))
-                .name("late-event-kafka-sink");
+    feature_json = features.map(feature_to_json, output_type=Types.STRING())
+    feature_json.sink_to(kafka_sink(bootstrap_servers, FEATURE_TOPIC, "customer-feature-")) \
+        .name("aggregate-kafka-sink") \
+        .uid("aggregate-kafka-sink")
+
+    late_json = features.get_side_output(LATE_OUTPUT).map(
+        event_to_json, output_type=Types.STRING()
+    )
+    late_json.sink_to(kafka_sink(bootstrap_servers, LATE_TOPIC, "late-event-")) \
+        .name("late-event-kafka-sink") \
+        .uid("late-event-kafka-sink")
 ```
 
 > **Note**
-> Khi watermark đã vượt `window_end`, `allowedLateness=0` làm event đi thẳng sang side output và Kafka late topic. Integration test phát một probe cũ 32 ngày sau khi watermark tiến lên và chỉ pass khi consumer `read_committed` đọc được probe ở topic này.
+> Khi watermark đã vượt `window_end`, `allowed_lateness(0)` làm event đi sang side output và Kafka late topic. Cả feature sink và late sink dùng Kafka transaction/exactly-once helper. Integration test chỉ pass khi consumer `read_committed` đọc được aggregate và late probe đúng topic.
 
 ## Đưa aggregate từ Flink vào Feast
 
 ### PushSource và online/offline stores
 
-Source: [`feast/features.py`, lines 67–90](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/feast/features.py#L67-L90)
+Source: [`feast/features.py`, lines 67–90](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/feast/features.py#L67-L90)
 
 ```python
 flink_aggregates_batch = FileSource(
@@ -330,7 +330,7 @@ customer_30d_flink = StreamFeatureView(
 
 ### HTTP push có retry
 
-Source: [`pusher.py`, lines 59–71](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/python/feature_store_demo/pusher.py#L59-L71)
+Source: [`pusher.py`, lines 59–71](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/python/feature_store_demo/pusher.py#L59-L71)
 
 ```python
 def push_with_retry(records: list[dict[str, Any]], attempts: int = 5) -> requests.Response:
@@ -353,7 +353,7 @@ def push_with_retry(records: list[dict[str, Any]], attempts: int = 5) -> request
 
 ### Chỉ commit Kafka sau khi push thành công
 
-Source: [`pusher.py`, lines 141–152](https://github.com/itsmekhoathekid/feature-store/blob/6b4944bc6b73319b3ad291794d26ff0ea2db671c/python/feature_store_demo/pusher.py#L141-L152)
+Source: [`pusher.py`, lines 141–152](https://github.com/itsmekhoathekid/feature-store/blob/eae32219a8871d01245f172f43c008d687486243/python/feature_store_demo/pusher.py#L141-L152)
 
 ```python
     if pending:
@@ -375,9 +375,9 @@ Source: [`pusher.py`, lines 141–152](https://github.com/itsmekhoathekid/featur
 
 ## Kiểm thử
 
-`make test` chạy Java unit/operator tests và Python tests/lint. Java test bao phủ bốn method của `AggregateFunction`, `ValueState`/TTL, biên `[T-30d,T)`, hourly slide, watermark và idle partition. `make demo-flink` kiểm tra Kafka → Flink → aggregate topic, `read_committed`, late side output, PushSource → Redis/Parquet. `make demo-sfv` kiểm tra riêng Spark `StreamFeatureView`. `make verify` so parity tại đúng timestamp cửa sổ của SFV. `make test-restart` stop job bằng canonical savepoint, restore state, seed duplicate rồi xác minh kết quả không đổi.
+`make test` chạy PyFlink tests và Feast/Pusher tests/lint. PyFlink test bao phủ bốn method của `AggregateFunction`, `ValueState`/TTL, biên `[T-30d,T)`, hourly slide, timestamp assigner, watermark/idleness và validation. `make demo-flink` kiểm tra Kafka → Flink → aggregate topic, `read_committed`, late side output, PushSource → Redis/Parquet. `make demo-sfv` kiểm tra riêng Spark `StreamFeatureView`. `make verify` so parity tại đúng timestamp cửa sổ của SFV. `make test-restart` stop job bằng canonical savepoint, restore state, seed duplicate rồi xác minh kết quả không đổi.
 
-CI chạy Java, Python và Docker Compose smoke test. `scripts/check_readme_references.py` yêu cầu mọi code block khớp byte-for-byte với line range tại commit permalink và với source hiện tại; thay code hoặc làm lệch dòng sẽ buộc cập nhật README trước khi merge.
+CI chạy PyFlink, Feast/Pusher Python và Docker Compose smoke test. `scripts/check_readme_references.py` yêu cầu mọi code block khớp byte-for-byte với line range tại commit permalink và với source hiện tại; thay code hoặc làm lệch dòng sẽ buộc cập nhật README trước khi merge.
 
 ## Tài liệu nền
 
