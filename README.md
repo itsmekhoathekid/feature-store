@@ -11,7 +11,37 @@ Không có pipeline thứ ba. Toàn bộ runtime chạy bằng Docker Compose; d
 
 Pipeline Feast đi theo luồng: raw event → Kafka → raw mirror → Parquet → Feast `StreamFeatureView`/Spark → Redis.
 
+```mermaid
+flowchart LR
+    raw1["Raw transaction"] --> kafka1["Kafka: raw.transactions.v1"]
+    kafka1 --> mirror["Raw mirror: deduplicate by event_id"]
+    mirror --> parquet1[("Raw Parquet batch source")]
+    kafka1 -.-> sfv["Feast StreamFeatureView: schema and watermark"]
+    parquet1 --> sfv
+    sfv --> spark["Spark: 30-day window, 1-hour slide, tiling"]
+    spark --> redis1[("Redis online store")]
+```
+
 Pipeline Flink đi theo luồng: raw event → Kafka → validate → watermark → deduplicate → sliding window → aggregate topic → Python pusher → Feast `/push` → Redis và Parquet.
+
+```mermaid
+flowchart LR
+    raw2["Raw transaction"] --> kafka2["Kafka: raw.transactions.v1"]
+    kafka2 --> validate["Deserialize and validate"]
+    validate --> watermark["Event time: watermark 1h, idleness 1m"]
+    validate -->|"invalid payload"| invalid["Kafka: transactions.invalid.v1"]
+    watermark --> dedup["Key by event_id: ValueState TTL 32d"]
+    dedup -->|"conflicting duplicate"| invalid
+    dedup --> window["Key by customer_id: sliding window 30d / 1h"]
+    window -->|"late event"| late["Kafka: transactions.late.v1"]
+    window --> aggregate["AggregateFunction and ProcessWindowFunction"]
+    aggregate --> features["Kafka exactly-once: features.customer_30d.v1"]
+    features --> pusher["Python Feast pusher: read_committed"]
+    pusher -->|"permanent failure"| dlq["Kafka: features.customer_30d.push-dlq.v1"]
+    pusher --> push["Feast PushSource"]
+    push --> redis2[("Redis online store")]
+    push --> parquet2[("Parquet offline store")]
+```
 
 Các topic chính:
 

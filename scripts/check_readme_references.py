@@ -16,6 +16,7 @@ SOURCE_BLOCK = re.compile(
     r"```[^\n]*\n(.*?)\n```\n\n> \*\*Note\*\*",
     re.DOTALL,
 )
+FENCED_BLOCK = re.compile(r"```([^\n]*)\n.*?\n```", re.DOTALL)
 
 
 def git_file(commit: str, relative_path: str) -> str:
@@ -50,9 +51,12 @@ def main() -> int:
     if len(blocks) < expected:
         print(f"Expected at least {expected} verified source blocks, found {len(blocks)}")
         return 1
-    code_fences = readme_text.count("```") // 2
-    if code_fences != len(blocks):
-        print("Every README code block must have a Source permalink and an immediate Note")
+    implementation_fences = [
+        match for match in FENCED_BLOCK.finditer(readme_text)
+        if match.group(1).strip().lower() != "mermaid"
+    ]
+    if len(implementation_fences) != len(blocks):
+        print("Every non-Mermaid code block must have a Source permalink and an immediate Note")
         return 1
 
     commits = {match.group(3) for match in blocks}
