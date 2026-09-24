@@ -1,11 +1,10 @@
-from pyflink.common import Time
-from pyflink.datastream.state import StateTtlConfig
-
 from feature_store_flink.operators import (
     INVALID_OUTPUT,
     DeduplicateByEventId,
     event_fingerprint,
 )
+from pyflink.common import Time
+from pyflink.datastream.state import StateTtlConfig
 
 
 class FakeValueState:
@@ -53,4 +52,3 @@ def test_value_state_ttl_is_32_days_and_never_returns_expired_values() -> None:
     assert ttl.get_ttl() == Time.days(32)
     assert ttl.get_update_type() == StateTtlConfig.UpdateType.OnCreateAndWrite
     assert ttl.get_state_visibility() == StateTtlConfig.StateVisibility.NeverReturnExpired
-

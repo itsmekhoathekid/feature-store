@@ -1,10 +1,9 @@
 import cloudpickle
-from pyflink.common import Time
-from pyflink.datastream.window import SlidingEventTimeWindows
-
 from feature_store_flink.job import watermark_strategy
 from feature_store_flink.operators import LATE_OUTPUT, EventTimestampAssigner
 from feature_store_flink.types import EVENT_TYPE
+from pyflink.common import Time
+from pyflink.datastream.window import SlidingEventTimeWindows
 
 HOUR_MS = 60 * 60 * 1000
 DAY_MS = 24 * HOUR_MS

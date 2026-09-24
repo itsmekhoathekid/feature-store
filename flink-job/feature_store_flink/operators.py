@@ -1,7 +1,7 @@
 import hashlib
 import json
 from datetime import UTC, datetime
-from typing import Any, Iterable
+from typing import Any, Iterable  # noqa: UP035 - PyFlink 2.2 supports Python 3.9.
 
 from pyflink.common import Time, Types
 from pyflink.common.watermark_strategy import TimestampAssigner

@@ -1,7 +1,6 @@
 import json
 
 import pytest
-
 from feature_store_flink.operators import parse_transaction
 
 
@@ -36,4 +35,3 @@ def test_valid_transaction_contract() -> None:
 def test_invalid_transaction_contract(payload: str) -> None:
     with pytest.raises(ValueError):
         parse_transaction(payload)
-
